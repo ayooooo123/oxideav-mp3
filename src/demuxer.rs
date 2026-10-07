@@ -56,16 +56,21 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_core::{
-    AudioTrim, CodecId, CodecParameters, CodecResolver, CodecTag, ContainerRegistry, Demuxer, Error,
-    Packet, PacketMetadata, ProbeData, ReadSeek, Result, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, CodecTag, ContainerRegistry, Demuxer, Error, Packet,
+    PacketMetadata, ProbeData, ReadSeek, Result, StreamInfo, TimeBase,
 };
 
-use crate::frame::{parse_header, Layer, Mp3FrameHeader, MpegVersion};
+use crate::frame::{parse_header, Layer, MpegVersion};
 use crate::lame_tag::{parse_lame_tag, LameTag};
 use crate::side_info::{
     SIDE_INFO_BYTES_LSF_MONO, SIDE_INFO_BYTES_LSF_STEREO, SIDE_INFO_BYTES_MONO,
     SIDE_INFO_BYTES_STEREO,
 };
+
+mod gapless;
+mod smpb;
+
+use gapless::Gapless;
 
 /// Format-registry name used by the container registry.
 pub const FORMAT_NAME: &str = "mp3";
@@ -83,11 +88,8 @@ pub const WAVE_FORMAT_MP3: u16 = 0x0055;
 
 /// MP3 metadata extracted from the on-disk container frontmatter.
 ///
-/// We only ever read enough of the ID3v2 header to advance past the
-/// tag — we do not currently parse individual frames. The
-/// `id3v2_present` / `id3v1_present` flags expose whether either tag
-/// was found so callers (and tests) can confirm the demuxer noticed
-/// them.
+/// The ID3 flags and sizes describe the frontmatter/trailer. iTunSMPB
+/// comment and user-text frames also supply gapless sample counts.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Mp3Tags {
     /// `true` when an ID3v2 tag was detected at offset 0.
@@ -647,12 +649,18 @@ impl Mp3Demuxer {
         });
 
         // 5c. Gapless playback, read the way FFmpeg reads the info tag
-        //     (any Xing flag subset, LAME / Lavf / Lavc encoders).
-        let gapless = info_tag_gapless(
+        //     (any Xing flag subset, LAME / Lavf / Lavc encoders), and,
+        //     without its start skip, iTunSMPB.
+        let mut frames = 0;
+        let mut gapless = gapless::info_tag(
             &first_frame_buf,
             &first_header,
             total_len.saturating_sub(first_frame_offset + 4),
+            &mut frames,
         );
+        if gapless.is_none() && first_header.layer == Layer::LayerIII {
+            gapless = gapless::itunes(smpb::read(input.as_mut()), &first_header, frames);
+        }
 
         // 6. Decide where playable audio starts. A Xing/Info frame
         //    carries no PCM — its slot is reserved as a metadata
@@ -709,13 +717,13 @@ impl Mp3Demuxer {
         // duration (which equals (frame_count × samples_per_frame)
         // for the VBR case, and the bitrate-derived sample count for
         // the CBR case).
-        let trimmed_duration_samples: Option<i64> = match (lame.as_ref(), duration_samples) {
+        let trimmed_duration_samples: Option<i64> = gapless.and_then(|g| g.presented_samples()).or_else(|| match (lame.as_ref(), duration_samples) {
             (Some(tag), Some(gross)) if tag.has_gapless_trim() => {
                 let trim = (tag.encoder_delay as i64) + (tag.zero_padding as i64);
                 Some((gross - trim).max(0))
             }
             (_, dur) => dur,
-        };
+        });
 
         let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
         params.sample_rate = Some(sample_rate);
@@ -726,7 +734,7 @@ impl Mp3Demuxer {
         let stream = StreamInfo {
             index: 0,
             time_base,
-            duration: duration_samples,
+            duration: gapless.and_then(|g| g.presented_samples()).or(duration_samples),
             start_time: Some(0),
             params,
         };
@@ -965,107 +973,6 @@ fn measure_free_format_base_len(
     Err(Error::unsupported(
         "no second free-format frame sync within the scan window",
     ))
-}
-
-/// Encoder delay and padding of a Layer III stream, in decoder output
-/// samples counted from the first audio frame after the info frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Gapless {
-    /// Skipped from the first audio frame's output on: the encoder delay
-    /// plus the decoder's own 529-sample delay.
-    start_skip: u32,
-    /// The output samples `[first, last)` that are padding, when the info
-    /// frame counts the frames.
-    window: Option<(i64, i64)>,
-    samples_per_frame: i64,
-}
-
-impl Gapless {
-    /// The trim of the packet whose output starts at sample `pts`
-    /// (FFmpeg demux.c `read_frame_internal`).
-    fn trim_at(&self, pts: i64, sample_rate: u32) -> Option<AudioTrim> {
-        let skip = if pts == 0 { self.start_skip } else { 0 };
-        let discard = match self.window {
-            Some((first, last)) => {
-                let end = pts.saturating_add(self.samples_per_frame);
-                if first != 0 && end >= first && pts < last {
-                    (end - first).min(self.samples_per_frame)
-                } else {
-                    0
-                }
-            }
-            None => 0,
-        };
-        (skip > 0 || discard > 0).then(|| AudioTrim {
-            skip_samples: skip,
-            discard_padding: discard as u32,
-            sample_rate,
-        })
-    }
-}
-
-/// Gapless playback as FFmpeg 2da55bf `mp3dec.c` (`mp3_parse_info_tag`)
-/// reads it from the first frame of a Layer III stream: after the
-/// Xing / Info magic (at the side-info offset, CRC ignored) and the
-/// fields its flags select come the 9-byte encoder version, eleven bytes
-/// of LAME fields, and the 24-bit encoder delay | padding. Only LAME,
-/// Lavf and Lavc encoders are trusted. The frame count, unless the file
-/// is much larger than the info frame declares (a concatenation), places
-/// the end padding. `after_header` is the file length from the end of
-/// the first frame's header.
-fn info_tag_gapless(frame: &[u8], header: &Mp3FrameHeader, after_header: u64) -> Option<Gapless> {
-    if header.layer != Layer::LayerIII {
-        return None;
-    }
-    let be32 = |at: usize| frame.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-    let lsf = header.version != MpegVersion::Mpeg1;
-    let mono = header.channel_count() == 1;
-    let mut at = 4 + match (lsf, mono) {
-        (false, false) => 32,
-        (false, true) | (true, false) => 17,
-        (true, true) => 9,
-    };
-    let magic = frame.get(at..at + 4)?;
-    if magic != b"Xing" && magic != b"Info" {
-        return None;
-    }
-    let flags = be32(at + 4)?;
-    at += 8;
-    let mut frames = 0u32;
-    if flags & 1 != 0 {
-        frames = be32(at)?;
-        at += 4;
-    }
-    if flags & 2 != 0 {
-        let declared = u64::from(be32(at)?);
-        at += 4;
-        if after_header > 0 && declared > 0 {
-            let min = after_header.min(declared);
-            if after_header > declared && after_header - min > min >> 4 {
-                frames = 0;
-            }
-        }
-    }
-    if flags & 4 != 0 {
-        at += 100;
-    }
-    if flags & 8 != 0 {
-        at += 4;
-    }
-    let version = frame.get(at..at + 4)?;
-    if !matches!(version, b"LAME" | b"Lavf" | b"Lavc") {
-        return None;
-    }
-    let delays = frame.get(at + 21..at + 24)?;
-    let v = u32::from_be_bytes([0, delays[0], delays[1], delays[2]]);
-    let (start_pad, end_pad) = (i64::from(v >> 12), i64::from(v & 0xFFF));
-    let samples_per_frame = i64::from(header.samples_per_frame());
-    let total = i64::from(frames) * samples_per_frame;
-    Some(Gapless {
-        start_skip: (start_pad + 529) as u32,
-        window: (frames > 0).then_some((total - end_pad + 529, total)),
-        samples_per_frame,
-    })
 }
 
 /// Extract a Layer III frame's `main_data_begin` reservoir back-pointer

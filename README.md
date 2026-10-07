@@ -260,4 +260,7 @@ decoder without error, and cover the pushed PCM sample count.
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](./LICENSE) — except the gapless metadata
+(`src/demuxer/gapless.rs`, `src/demuxer/smpb.rs`), ported from FFmpeg and
+LGPL-2.1-or-later (see [LICENSE-LGPL](./LICENSE-LGPL)); the crate as a whole
+is `MIT AND LGPL-2.1-or-later`.

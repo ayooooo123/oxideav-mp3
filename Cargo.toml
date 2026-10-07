@@ -3,7 +3,7 @@ name = "oxideav-mp3"
 version = "0.1.3"
 edition = "2021"
 rust-version = "1.80"
-license = "MIT"
+license = "MIT AND LGPL-2.1-or-later"
 repository = "https://github.com/OxideAV/oxideav-mp3"
 authors = ["Mark Karpeles"]
 description = "Pure-Rust MPEG-1/2 Audio Layer III (MP3) decoder + minimum-viable CBR encoder"
@@ -15,6 +15,7 @@ categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
 oxideav-core = "0.1"
+oxideav-id3 = "0.0.6"
 
 [dev-dependencies]
 # Round 290 (depth-mode benchmarks): Criterion drives the two decode

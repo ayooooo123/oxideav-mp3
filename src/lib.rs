@@ -382,6 +382,11 @@
 //! The remaining Phase 2 work — LSF / VBR decode and LSF / true-VBR
 //! encode — is still a later round.
 //!
+//! The upstream code is MIT. The gapless metadata (`demuxer::gapless`,
+//! `demuxer::smpb`) is ported from FFmpeg and is LGPL-2.1-or-later (see
+//! `LICENSE-LGPL` and each file's notice); the crate as a whole is
+//! `MIT AND LGPL-2.1-or-later`.
+//!
 //! [`Encoder`]: oxideav_core::Encoder
 //!
 //! [`Read`]: std::io::Read
