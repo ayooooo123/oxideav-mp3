@@ -8,6 +8,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Gapless playback as packet metadata**: `Demuxer::packet_metadata()
+  .audio_trim` carries FFmpeg 2da55bf mp3dec.c's trims for a Layer III
+  Xing / Info frame with a LAME, Lavf or Lavc extension (read after
+  whichever Xing fields the flags select): the encoder delay plus the
+  decoder's 529 samples skipped from the first audio frame (pts 0, also
+  after a seek back to it), and, when the frame count is known (and the
+  file is not a concatenation far larger than declared), the padding
+  `[frames × spf − padding + 529, frames × spf)` dropped from the frames
+  reaching into it. Metadata clears before every read and seek. Requires
+  the PearTube oxideav-core fork's `Demuxer::packet_metadata`.
+
 - **8 kHz (MPEG-2.5) mixed-block encoding — the r405/r408 emit
   refusal is lifted** (r440, conformance-closure round). The refusal
   rested on deployed decoders splitting 3-1 on the mixed carve-out's
