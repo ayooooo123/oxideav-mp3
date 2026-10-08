@@ -75,16 +75,28 @@ use gapless::Gapless;
 /// Format-registry name used by the container registry.
 pub const FORMAT_NAME: &str = "mp3";
 
-/// CodecId stream parameters carry for the audio inside an MP3
-/// container. The codec crate itself doesn't yet expose a decoder,
-/// but pipelines that go through `CodecResolver` use this identifier.
+/// CodecId stream parameters carry for Layer III audio. Layer I and II
+/// streams are named `mp1` and `mp2` ([`codec_id_for`]).
 pub const CODEC_ID_STR: &str = "mp3";
+
+/// The codec of a stream whose first frame has `layer`, as FFmpeg's MPEG
+/// audio parser names the stream its mp3 demuxer reads
+/// (`ff_mpa_decode_header`: MP1, MP2 or MP3).
+pub fn codec_id_for(layer: Layer) -> &'static str {
+    match layer {
+        Layer::LayerI => "mp1",
+        Layer::LayerII => "mp2",
+        Layer::LayerIII => CODEC_ID_STR,
+    }
+}
 
 /// `WAVEFORMATEX::wFormatTag` value historically assigned to MP3 by
 /// Microsoft for the Windows AVI / WAV container ecosystem (0x0055,
 /// "MPEGLAYER3"). Surfaced on `CodecParameters::tag` so re-muxers can
 /// preserve the original on-wire tag.
 pub const WAVE_FORMAT_MP3: u16 = 0x0055;
+/// `WAVE_FORMAT_MPEG` (0x0050), the tag of Layer I and II audio.
+pub const WAVE_FORMAT_MPEG: u16 = 0x0050;
 
 /// MP3 metadata extracted from the on-disk container frontmatter.
 ///
@@ -375,13 +387,34 @@ fn detect_id3v1(input: &mut Box<dyn ReadSeek>, total_len: u64) -> Result<bool> {
     Ok(n == 3 && &tag == b"TAG")
 }
 
+/// How many frames follow one another from `buf[at]`: each a valid header
+/// of the first's layer, version and rate, at the distance the previous
+/// one's size gives (FFmpeg's mp3_read_probe counts frames this way).
+fn consecutive_frames(buf: &[u8], mut at: usize) -> usize {
+    let mut first = None;
+    let mut n = 0;
+    while at + 4 <= buf.len() {
+        let Ok(h) = parse_header(&buf[at..at + 4]) else { break };
+        let key = (h.layer, h.version, h.sample_rate_hz);
+        if *first.get_or_insert(key) != key {
+            break;
+        }
+        let Some(len) = h.frame_len().filter(|&l| l > 4) else { break };
+        n += 1;
+        at += len;
+    }
+    n
+}
+
 /// Container-level probe — `register_probe` invokes this with the
-/// first ~256 KB of an unknown input to score it as MP3.
+/// first ~256 KB of an unknown input to score it as MPEG audio.
 ///
 /// Returns a high score on the canonical ID3v2 / "Xing" / "Info" /
 /// frame-sync prefixes, a lower score on a bare frame sync, and zero
 /// otherwise. The extension hint `.mp3` (or `.mp2`/`.mp1`) bumps the
-/// confidence for streams that only carry a frame-sync prefix.
+/// confidence for streams that only carry a frame-sync prefix. Layer I
+/// and II syncs are easier to mistake, so they count only when four frames
+/// follow one another (as FFmpeg's probe counts frames for every layer).
 pub fn probe(p: &ProbeData) -> u8 {
     // ID3v2 prefix at the start — strongest signal, since the tag
     // could otherwise be a different audio container that also
@@ -390,22 +423,20 @@ pub fn probe(p: &ProbeData) -> u8 {
     if p.buf.len() >= 10 && &p.buf[..3] == b"ID3" {
         if let Some(total) = id3v2_total_len(&p.buf[..10]) {
             let off = total as usize;
-            if off + 4 <= p.buf.len()
-                && p.buf[off] == 0xFF
-                && (p.buf[off + 1] & 0xE0) == 0xE0
-                && parse_header(&p.buf[off..off + 4])
-                    .map(|h| h.layer == Layer::LayerIII)
-                    .unwrap_or(false)
-            {
-                return 100;
+            if off + 4 <= p.buf.len() && p.buf[off] == 0xFF && (p.buf[off + 1] & 0xE0) == 0xE0 {
+                match parse_header(&p.buf[off..off + 4]) {
+                    Ok(h) if h.layer == Layer::LayerIII => return 100,
+                    Ok(_) if consecutive_frames(p.buf, off) >= 4 => return 100,
+                    _ => {}
+                }
             }
         }
     }
-    // Bare frame sync at offset 0 with a valid Layer III header.
+    // Bare frame sync at offset 0.
     if p.buf.len() >= 4 && p.buf[0] == 0xFF && (p.buf[1] & 0xE0) == 0xE0 {
         if let Ok(h) = parse_header(&p.buf[..4]) {
-            if h.layer == Layer::LayerIII {
-                return if matches!(p.ext, Some("mp3") | Some("mp2") | Some("mp1")) {
+            if h.layer == Layer::LayerIII || consecutive_frames(p.buf, 0) >= 4 {
+                return if matches!(p.ext, Some("mp3") | Some("mp2") | Some("mp1") | Some("m2a") | Some("mpa")) {
                     100
                 } else {
                     75
@@ -427,6 +458,9 @@ pub fn register_container(reg: &mut ContainerRegistry) {
     reg.register_extension("mp3", FORMAT_NAME);
     reg.register_extension("mp2", FORMAT_NAME);
     reg.register_extension("mp1", FORMAT_NAME);
+    // FFmpeg's mp3 demuxer also claims these.
+    reg.register_extension("m2a", FORMAT_NAME);
+    reg.register_extension("mpa", FORMAT_NAME);
     reg.register_probe(FORMAT_NAME, probe);
 }
 
@@ -725,11 +759,12 @@ impl Mp3Demuxer {
             (_, dur) => dur,
         });
 
-        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        let layer = first_header.layer;
+        let mut params = CodecParameters::audio(CodecId::new(codec_id_for(layer)));
         params.sample_rate = Some(sample_rate);
         params.channels = Some(channels as u16);
         params.bit_rate = bitrate_bps.map(|b| b as u64);
-        params.tag = Some(CodecTag::wave_format(WAVE_FORMAT_MP3));
+        params.tag = Some(CodecTag::wave_format(if layer == Layer::LayerIII { WAVE_FORMAT_MP3 } else { WAVE_FORMAT_MPEG }));
 
         let stream = StreamInfo {
             index: 0,
