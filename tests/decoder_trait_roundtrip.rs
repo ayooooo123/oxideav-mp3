@@ -171,13 +171,13 @@ fn registry_decoder_emits_audio_frames_with_monotonic_pts() {
         assert_eq!(
             a.data.len(),
             1,
-            "mono S16 frame should have exactly 1 plane",
+            "mono F32P frame should have exactly 1 plane",
         );
-        // Interleaved/planar S16 mono → 2 bytes per sample.
+        // Planar f32 mono → 4 bytes per sample.
         assert_eq!(
             a.data[0].len(),
-            (a.samples as usize) * 2,
-            "S16 plane length mismatch",
+            (a.samples as usize) * 4,
+            "F32P plane length mismatch",
         );
         let pts = a.pts.expect("PTS stamped from inbound packet");
         assert!(pts > prev_pts, "PTS not monotonic ({prev_pts} >= {pts})");
@@ -207,8 +207,10 @@ fn registry_decoder_byte_exact_against_direct_chain() {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    for chunk in a.data[0].chunks_exact(2) {
-                        trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    for chunk in a.data[0].chunks_exact(4) {
+                        trait_out.push(oxideav_mp3::synth::pcm_f32_to_i16(f32::from_le_bytes([
+                            chunk[0], chunk[1], chunk[2], chunk[3],
+                        ])));
                     }
                 }
                 Ok(other) => panic!("non-audio frame: {other:?}"),

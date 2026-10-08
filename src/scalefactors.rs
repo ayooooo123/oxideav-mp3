@@ -1,3 +1,7 @@
+// MIT, except `Reservoir::assemble_over_gap` and
+// `decode_scalefactors_after_gap`, which follow FFmpeg 2da55bf
+// libavcodec/mpegaudiodec_template.c `mp_decode_layer3` (Copyright (c)
+// 2001, 2002 Fabrice Bellard; LGPL-2.1-or-later, see LICENSE-LGPL).
 //! Layer III **scalefactor decode** — the main-data stage between
 //! side-information parsing and Huffman decoding.
 //!
@@ -270,6 +274,26 @@ impl Reservoir {
         run.extend_from_slice(frame_main_data);
         self.push_and_trim(frame_main_data);
         Ok(run)
+    }
+
+    /// [`Reservoir::assemble`] that never fails: when `main_data_begin`
+    /// reaches back past the bytes buffered (the stream started or
+    /// resumed inside a reservoir), the run starts with zero bytes in
+    /// place of the missing history. Returns the run and how many bytes
+    /// were missing; FFmpeg's `mp_decode_layer3` then zeroes the leading
+    /// granules whose data lies in them and decodes the rest.
+    pub fn assemble_over_gap(
+        &mut self,
+        main_data_begin: usize,
+        frame_main_data: &[u8],
+    ) -> (Vec<u8>, usize) {
+        let missing = main_data_begin.saturating_sub(self.buf.len());
+        let carry_start = self.buf.len() - (main_data_begin - missing);
+        let mut run = vec![0u8; missing];
+        run.extend_from_slice(&self.buf[carry_start..]);
+        run.extend_from_slice(frame_main_data);
+        self.push_and_trim(frame_main_data);
+        (run, missing)
     }
 
     fn push_and_trim(&mut self, frame_main_data: &[u8]) {
@@ -941,6 +965,32 @@ pub fn decode_scalefactors(
     side_info: &SideInfo,
     main_data: &[u8],
 ) -> Result<FrameScaleFactors, ScaleFactorError> {
+    decode_scalefactors_after_gap(
+        header,
+        side_info,
+        main_data,
+        0,
+        &[ScaleFactors::default(); 2],
+    )
+}
+
+/// [`decode_scalefactors`] for a frame whose first `zeroed` granules lie
+/// in reservoir history the decoder never saw (see
+/// [`Reservoir::assemble_over_gap`]). As FFmpeg's `mp_decode_layer3` does,
+/// nothing is read for those granules (their `part2_3_length` bits are
+/// skipped), and granule 0 keeps the scalefactors it last decoded,
+/// `previous_granule0`, which a later granule's `scfsi` then reuses.
+///
+/// # Errors
+///
+/// As [`decode_scalefactors`].
+pub fn decode_scalefactors_after_gap(
+    header: &Mp3FrameHeader,
+    side_info: &SideInfo,
+    main_data: &[u8],
+    zeroed: usize,
+    previous_granule0: &[ScaleFactors; 2],
+) -> Result<FrameScaleFactors, ScaleFactorError> {
     let mut r = MainDataReader::new(main_data);
     let mut out = FrameScaleFactors {
         granules: [[ScaleFactors::default(); 2]; 2],
@@ -948,6 +998,7 @@ pub fn decode_scalefactors(
         channels: side_info.channels,
         part2_bits: [[0; 2]; 2],
     };
+    out.granules[0] = *previous_granule0;
 
     let nch = side_info.channels as usize;
     let ngr = side_info.granule_count as usize;
@@ -968,6 +1019,12 @@ pub fn decode_scalefactors(
     match header.version {
         MpegVersion::Mpeg1 => {
             for gr in 0..ngr {
+                if gr < zeroed {
+                    for ch in 0..nch {
+                        skip_bits(&mut r, side_info.granules[gr][ch].part2_3_length as usize);
+                    }
+                    continue;
+                }
                 for ch in 0..nch {
                     let gc = &side_info.granules[gr][ch];
                     let prev = if gr == 1 {
@@ -999,7 +1056,7 @@ pub fn decode_scalefactors(
         // `MpegVersion` doc-comment).
         MpegVersion::Mpeg2 | MpegVersion::Mpeg25 => {
             // LSF: exactly one granule.
-            for ch in 0..nch {
+            for ch in (0..nch).filter(|_| zeroed == 0) {
                 let gc = &side_info.granules[0][ch];
                 let is_intensity_right = intensity && ch == 1;
                 let start_bit = r.bit_pos();

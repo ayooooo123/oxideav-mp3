@@ -1,3 +1,8 @@
+// MIT, except the planar float output and the decoding of cut frames and
+// reservoir gaps in `decode_packet`, which follow FFmpeg 2da55bf
+// libavcodec/mpegaudiodec_template.c `decode_frame` and `mp_decode_layer3`
+// (Copyright (c) 2001, 2002 Fabrice Bellard; LGPL-2.1-or-later, see
+// LICENSE-LGPL).
 //! `oxideav_core::Decoder` wiring for MPEG-1 Audio Layer III.
 //!
 //! Symmetric counterpart to [`crate::codec_encoder`]. Where the encoder
@@ -15,7 +20,7 @@
 //!   side-info + main-data slot), matching what
 //!   [`crate::Mp3Demuxer::next_packet`] emits.
 //! * [`receive_frame`](Decoder::receive_frame) returns one
-//!   [`AudioFrame`] holding planar S16 PCM for that frame's granules
+//!   [`AudioFrame`] holding planar `f32` PCM for that frame's granules
 //!   (MPEG-1 = two granules × 576 samples = 1152 samples per channel,
 //!   MPEG-2 LSF = one granule × 576 samples = 576 samples per channel).
 //! * [`flush`](Decoder::flush) drains any buffered frame and signals
@@ -32,9 +37,9 @@
 //! The wrapper parses the packet's MP3 frame, walks the existing
 //! [`decode_huffman`] → [`requantize`] → [`alias_reduce`] →
 //! [`imdct_granule`] → [`synth_granule`] chain (per granule per
-//! channel), and converts the float PCM run to interleaved `i16` little-
-//! endian bytes for the returned [`AudioFrame`]. Per-frame PTS is taken
-//! verbatim from the inbound packet when present.
+//! channel), and hands the synthesis output on as planar `f32`, FFmpeg's
+//! `mp3float` output (`fltp`), with no rounding to 16 bits. Per-frame PTS
+//! is taken verbatim from the inbound packet when present.
 //!
 //! ## Scope
 //!
@@ -79,16 +84,18 @@
 //!
 //! Output PCM follows the framework's `AudioFrame` convention: one
 //! `data[plane]` entry per channel (planar layout), with each plane
-//! holding little-endian `i16` samples. Mono output keeps the single
-//! plane; stereo output writes two planes (`data[0]` = L, `data[1]` = R).
+//! holding little-endian `f32` samples at full scale ±1.0
+//! ([`SampleFormat::F32P`], reported through
+//! [`Decoder::output_audio_format`]). Mono output keeps the single plane;
+//! stereo output writes two planes (`data[0]` = L, `data[1]` = R).
 //! Per-channel sample count per frame is 1152 on MPEG-1 (two granules)
 //! and 576 on MPEG-2 LSF (one granule).
 
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    AudioFrame, CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag,
-    Decoder, Error, Frame, Packet, Result, SampleFormat,
+    AudioFormat, AudioFrame, CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry,
+    CodecTag, Decoder, Error, Frame, Packet, Result, SampleFormat,
 };
 
 use crate::alias::alias_reduce;
@@ -99,10 +106,10 @@ use crate::huffman::decode_huffman;
 use crate::imdct::{imdct_granule, ImdctState};
 use crate::reorder::reorder;
 use crate::requantize::requantize;
-use crate::scalefactors::{decode_scalefactors, MainDataReader, Reservoir};
+use crate::scalefactors::{decode_scalefactors_after_gap, MainDataReader, Reservoir, ScaleFactors};
 use crate::side_info::parse_side_info;
 use crate::stream_encoder::SAMPLES_PER_FRAME_MPEG1;
-use crate::synth::{pcm_f32_to_i16, synth_granule, SynthState, PCM_PER_GRANULE};
+use crate::synth::{synth_granule, SynthState, PCM_PER_GRANULE};
 
 /// Build a boxed MPEG-1 / MPEG-2 LSF Audio Layer III [`Decoder`] from
 /// `params`.
@@ -134,7 +141,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
     out_params.sample_rate = Some(sample_rate);
     out_params.channels = Some(channels);
-    out_params.sample_format = Some(SampleFormat::S16);
+    out_params.sample_format = Some(SampleFormat::F32P);
     out_params.tag = Some(CodecTag::wave_format(WAVE_FORMAT_MP3));
 
     Ok(Box::new(Mp3CoreDecoder::new(
@@ -173,6 +180,11 @@ pub struct Mp3CoreDecoder {
     /// Per-channel polyphase synthesis shift register. Same indexing
     /// convention as `imdct_state`.
     synth_state: [SynthState; 2],
+    /// Per-channel scalefactors granule 0 decoded last. A frame whose
+    /// granule 0 lies in reservoir history never seen keeps them, as
+    /// FFmpeg's `s->granules[ch][0]` does, and granule 1's `scfsi` reuses
+    /// them. Like FFmpeg's flush, `reset` leaves them.
+    previous_granule0: [ScaleFactors; 2],
     pending_frames: VecDeque<AudioFrame>,
     /// Set once [`Decoder::flush`] has been called; `receive_frame`
     /// returns [`Error::Eof`] after `pending_frames` is empty.
@@ -197,18 +209,17 @@ impl Mp3CoreDecoder {
             reservoir: Reservoir::new(),
             imdct_state: [ImdctState::new(), ImdctState::new()],
             synth_state: [SynthState::new(), SynthState::new()],
+            previous_granule0: [ScaleFactors::default(); 2],
             pending_frames: VecDeque::new(),
             eof: false,
         }
     }
 
     /// Decode one MP3 frame from `packet` (header + optional CRC +
-    /// side-info + main-data slot). Returns the decoded
-    /// [`AudioFrame`] on success, or `Ok(None)` if the frame's
-    /// `main_data_begin` lookback exceeds the bytes currently in the
-    /// reservoir (caller should request more packets — but in practice
-    /// this only happens for the first ~2 frames of a freshly-opened
-    /// stream).
+    /// side-info + main-data slot), as FFmpeg's `mp3float` does: a frame
+    /// cut short by the end of the stream decodes over zeros, and a frame
+    /// whose `main_data_begin` reaches back past the bytes buffered still
+    /// decodes, with the granules whose data was never seen zeroed.
     fn decode_packet(&mut self, packet: &Packet) -> Result<Option<AudioFrame>> {
         let bytes = &packet.data;
         if bytes.len() < 4 {
@@ -277,16 +288,16 @@ impl Mp3CoreDecoder {
         // synthesis) is driven by `part2_3_length` from the side-info,
         // never by the bitrate, so a free-format frame decodes through the
         // identical chain once we know where its main-data slot ends.
-        let frame_len = match hdr.frame_len() {
-            Some(l) => {
-                if bytes.len() < l {
-                    return Err(Error::invalid(format!(
-                        "oxideav-mp3: packet len {} < header-implied frame len {l}",
-                        bytes.len()
-                    )));
-                }
-                l
+        // A frame cut short by the end of the stream decodes over zeros:
+        // FFmpeg's decoder reads past a short packet into its zeroed
+        // padding (mpegaudiodec_template.c, decode_frame).
+        let padded: Vec<u8>;
+        let (bytes, frame_len) = match hdr.frame_len() {
+            Some(l) if bytes.len() < l => {
+                padded = [&bytes[..], &vec![0; l - bytes.len()][..]].concat();
+                (&padded[..], l)
             }
+            Some(l) => (&bytes[..], l),
             None => {
                 // Free format (`bitrate_index == 0`): the packet itself is
                 // the frame. A 4-byte sync alone carries no audio.
@@ -295,7 +306,7 @@ impl Mp3CoreDecoder {
                         "oxideav-mp3: free-format frame has no main-data slot",
                     ));
                 }
-                bytes.len()
+                (&bytes[..], bytes.len())
             }
         };
 
@@ -317,23 +328,35 @@ impl Mp3CoreDecoder {
         }
         let main_slot = &bytes[main_slot_start..frame_len];
 
-        // Assemble main_data through the bit reservoir. If the look-
-        // back is larger than the reservoir's current contents we
-        // can't decode this frame yet — buffer its main-data and tell
-        // the caller to send more packets.
-        let run = match self
-            .reservoir
-            .assemble(usize::from(si.main_data_begin), main_slot)
-        {
-            Ok(run) => run,
-            Err(_) => return Ok(None),
-        };
-        let fsf = decode_scalefactors(&hdr, &si, &run)
+        // Assemble main_data through the bit reservoir. A lookback past the
+        // bytes buffered (the stream started or resumed inside a
+        // reservoir) decodes as FFmpeg's mp_decode_layer3 does: the leading
+        // granules whose data lies in the missing bytes are zeroed (their
+        // IMDCT still runs, so the overlap carries on) and the rest decode
+        // from where their data starts.
+        let main_data_begin = usize::from(si.main_data_begin);
+        let (run, missing) = self.reservoir.assemble_over_gap(main_data_begin, main_slot);
+        let mut zeroed = 0;
+        if missing > 0 {
+            let mut bits = (main_data_begin - missing) * 8;
+            while zeroed < si.granule_count as usize && bits < main_data_begin * 8 {
+                bits += (0..si.channels as usize)
+                    .map(|ch| usize::from(si.granules[zeroed][ch].part2_3_length))
+                    .sum::<usize>();
+                zeroed += 1;
+            }
+        }
+        let fsf = decode_scalefactors_after_gap(&hdr, &si, &run, zeroed, &self.previous_granule0)
             .map_err(|e| Error::other(format!("oxideav-mp3: scalefactors: {e:?}")))?;
+        if zeroed == 0 {
+            for ch in 0..si.channels as usize {
+                self.previous_granule0[ch] = fsf.granules[0][ch];
+            }
+        }
 
         let nch_si = si.channels as usize;
-        // Per-channel planar PCM buffer, one Vec<i16> per channel.
-        let mut pcm_planes: Vec<Vec<i16>> = (0..nch_si)
+        // Per-channel planar PCM buffer, one Vec<f32> per channel.
+        let mut pcm_planes: Vec<Vec<f32>> = (0..nch_si)
             .map(|_| Vec::with_capacity(SAMPLES_PER_FRAME_MPEG1))
             .collect();
         let mut bit_cursor = 0usize;
@@ -347,6 +370,10 @@ impl Mp3CoreDecoder {
             let mut xr_per_ch: Vec<[f32; 576]> = (0..nch_si).map(|_| [0.0; 576]).collect();
             for (ch, xr_slot) in xr_per_ch.iter_mut().enumerate() {
                 let gc = &si.granules[gr][ch];
+                if gr < zeroed {
+                    bit_cursor += gc.part2_3_length as usize;
+                    continue;
+                }
                 let mut r = MainDataReader::new(&run);
                 // Skip to the start of this granule/channel's
                 // `part2_3_length` field, then skip its part-2
@@ -391,7 +418,7 @@ impl Mp3CoreDecoder {
             // place per the header's `mode_extension` bits using the
             // right channel's scalefactors / granule-channel side info
             // for the intensity bound.
-            if nch_si == 2 && hdr.mode == crate::frame::ChannelMode::JointStereo {
+            if gr >= zeroed && nch_si == 2 && hdr.mode == crate::frame::ChannelMode::JointStereo {
                 let (left_xr, right_xr) = xr_per_ch.split_at_mut(1);
                 let left_arr: &mut [f32; 576] = &mut left_xr[0];
                 let right_arr: &mut [f32; 576] = &mut right_xr[0];
@@ -414,25 +441,17 @@ impl Mp3CoreDecoder {
                 let xar = alias_reduce(xr_ch, gc);
                 let subband_time = imdct_granule(&xar, gc, &mut self.imdct_state[ch]);
                 let pcm_f32 = synth_granule(&subband_time, &mut self.synth_state[ch]);
-                for &p in pcm_f32.iter().take(PCM_PER_GRANULE) {
-                    pcm_planes[ch].push(pcm_f32_to_i16(p));
-                }
+                pcm_planes[ch].extend_from_slice(&pcm_f32[..PCM_PER_GRANULE]);
             }
         }
 
         // Per-channel sample count this frame: MPEG-1 Layer III = 1152
         // (two granules × 576 PCM samples each).
         let samples_per_ch = (si.granule_count as usize) * PCM_PER_GRANULE;
-        // Pack each plane to little-endian i16 bytes.
+        // Pack each plane to little-endian f32 bytes.
         let data: Vec<Vec<u8>> = pcm_planes
             .iter()
-            .map(|plane| {
-                let mut bytes_le: Vec<u8> = Vec::with_capacity(plane.len() * 2);
-                for s in plane {
-                    bytes_le.extend_from_slice(&s.to_le_bytes());
-                }
-                bytes_le
-            })
+            .map(|plane| plane.iter().flat_map(|s| s.to_le_bytes()).collect())
             .collect();
         let frame = AudioFrame {
             samples: samples_per_ch as u32,
@@ -496,6 +515,17 @@ impl Decoder for Mp3CoreDecoder {
         self.eof = false;
         Ok(())
     }
+
+    /// Planar float at the rate and channel count of the frame decoded
+    /// last (each frame header may change them), FFmpeg's `mp3float`
+    /// output.
+    fn output_audio_format(&self) -> Option<AudioFormat> {
+        Some(AudioFormat {
+            sample_format: SampleFormat::F32P,
+            sample_rate: self.output.sample_rate?,
+            channels: self.output.channels?,
+        })
+    }
 }
 
 /// Install the MPEG-1 / MPEG-2 LSF Audio Layer III decoder factory
@@ -540,7 +570,9 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalefactors::decode_scalefactors;
     use crate::stream_encoder::{Mp3Encoder, SAMPLES_PER_FRAME_MPEG1};
+    use crate::synth::pcm_f32_to_i16;
     use oxideav_core::{Frame, TimeBase};
     use std::f32::consts::PI;
 
@@ -733,8 +765,10 @@ mod tests {
                     Ok(Frame::Audio(a)) => {
                         // Mono frame: data[0] is the interleaved S16
                         // byte run (interleaved == planar for mono).
-                        for chunk in a.data[0].chunks_exact(2) {
-                            trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                        for chunk in a.data[0].chunks_exact(4) {
+                            trait_out.push(pcm_f32_to_i16(f32::from_le_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                            ])));
                         }
                     }
                     Ok(other) => panic!("non-audio frame: {other:?}"),
@@ -750,8 +784,10 @@ mod tests {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    for chunk in a.data[0].chunks_exact(2) {
-                        trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    for chunk in a.data[0].chunks_exact(4) {
+                        trait_out.push(pcm_f32_to_i16(f32::from_le_bytes([
+                            chunk[0], chunk[1], chunk[2], chunk[3],
+                        ])));
                     }
                 }
                 Ok(other) => panic!("non-audio frame on flush: {other:?}"),
@@ -835,8 +871,10 @@ mod tests {
             loop {
                 match dec.receive_frame() {
                     Ok(Frame::Audio(a)) => {
-                        for chunk in a.data[0].chunks_exact(2) {
-                            trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                        for chunk in a.data[0].chunks_exact(4) {
+                            trait_out.push(pcm_f32_to_i16(f32::from_le_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                            ])));
                         }
                     }
                     Ok(other) => panic!("non-audio frame: {other:?}"),
@@ -931,13 +969,17 @@ mod tests {
             dec.send_packet(pkt).expect("send_packet (reset)");
             dec2.send_packet(pkt).expect("send_packet (fresh)");
             while let Ok(Frame::Audio(af)) = dec.receive_frame() {
-                for chunk in af.data[0].chunks_exact(2) {
-                    a.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                for chunk in af.data[0].chunks_exact(4) {
+                    a.push(pcm_f32_to_i16(f32::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ])));
                 }
             }
             while let Ok(Frame::Audio(af)) = dec2.receive_frame() {
-                for chunk in af.data[0].chunks_exact(2) {
-                    b.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                for chunk in af.data[0].chunks_exact(4) {
+                    b.push(pcm_f32_to_i16(f32::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ])));
                 }
             }
         }
@@ -1018,8 +1060,10 @@ mod tests {
             loop {
                 match dec.receive_frame() {
                     Ok(Frame::Audio(a)) => {
-                        for chunk in a.data[0].chunks_exact(2) {
-                            trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                        for chunk in a.data[0].chunks_exact(4) {
+                            trait_out.push(pcm_f32_to_i16(f32::from_le_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                            ])));
                         }
                     }
                     Ok(other) => panic!("non-audio frame: {other:?}"),
@@ -1032,8 +1076,10 @@ mod tests {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    for chunk in a.data[0].chunks_exact(2) {
-                        trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    for chunk in a.data[0].chunks_exact(4) {
+                        trait_out.push(pcm_f32_to_i16(f32::from_le_bytes([
+                            chunk[0], chunk[1], chunk[2], chunk[3],
+                        ])));
                     }
                 }
                 Ok(other) => panic!("non-audio frame on flush: {other:?}"),
@@ -1101,8 +1147,10 @@ mod tests {
             loop {
                 match dec.receive_frame() {
                     Ok(Frame::Audio(a)) => {
-                        for chunk in a.data[0].chunks_exact(2) {
-                            trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                        for chunk in a.data[0].chunks_exact(4) {
+                            trait_out.push(pcm_f32_to_i16(f32::from_le_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                            ])));
                         }
                     }
                     Ok(other) => panic!("non-audio frame: {other:?}"),
@@ -1115,8 +1163,10 @@ mod tests {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    for chunk in a.data[0].chunks_exact(2) {
-                        trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    for chunk in a.data[0].chunks_exact(4) {
+                        trait_out.push(pcm_f32_to_i16(f32::from_le_bytes([
+                            chunk[0], chunk[1], chunk[2], chunk[3],
+                        ])));
                     }
                 }
                 Ok(other) => panic!("non-audio frame on flush: {other:?}"),

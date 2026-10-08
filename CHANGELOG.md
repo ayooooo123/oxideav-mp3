@@ -6,6 +6,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Decoder output is planar float, as FFmpeg's `mp3float`** (PearTube
+  fork): `SampleFormat::F32P` at full scale ±1.0, reported through
+  `Decoder::output_audio_format`, instead of S16 rounded from the same
+  synthesis. The 16-bit rounding alone held the decode to 78-80 dB against
+  FFmpeg; every FATE mp3-conformance stream FFmpeg 2da55bf can read is now
+  at 126-135 dB with its exact sample count (`he_free.bit` is free format,
+  which that FFmpeg cannot open).
+
+### Fixed
+
+- **Frames FFmpeg decodes that were dropped** (follows FFmpeg 2da55bf
+  `mpegaudiodec_template.c`, LGPL): a frame cut short by the end of the
+  stream decodes over zeros (`decode_frame`); a frame whose
+  `main_data_begin` reaches back past the bytes buffered (a stream started
+  or resumed inside a bit reservoir) decodes with the granules whose data
+  was never seen zeroed and their scalefactors kept from the last granule
+  0 (`mp_decode_layer3`). `compl.bit` gave one frame too few and
+  `sin1k0db.bit` three.
+- **Intensity stereo as FFmpeg's `compute_stereo`**: the top long band
+  (21) and short band (12) are processed with the position of the band
+  below and count toward the intensity bound, and a mixed block's long
+  part is intensity-coded only when every short window of the right
+  channel is zero. `he_mode.bit`'s mixed-block MS+IS frames went from
+  18 dB to FFmpeg's output; the encoder couples short band 12 too, so its
+  intensity streams decode as intended under these rules.
+
 ### Added
 
 - **Gapless playback as packet metadata**: `Demuxer::packet_metadata()

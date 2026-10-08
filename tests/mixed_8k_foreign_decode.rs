@@ -72,9 +72,8 @@ fn own_decode(bytes: &[u8], sample_rate: u32) -> Vec<f32> {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    for chunk in a.data[0].chunks_exact(2) {
-                        let v = i16::from_le_bytes([chunk[0], chunk[1]]);
-                        out.push(f32::from(v) / 32768.0);
+                    for chunk in a.data[0].chunks_exact(4) {
+                        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                     }
                 }
                 Ok(other) => panic!("non-audio frame: {other:?}"),

@@ -1,3 +1,10 @@
+// MIT, except the intensity-stereo band rules in `process_long` and
+// `process_short` (the top bands taking the position of the band below,
+// band 12 counting toward the bound, and a mixed block's long part coded
+// as intensity only when every short window is zero), which follow FFmpeg
+// 2da55bf libavcodec/mpegaudiodec_template.c `compute_stereo`
+// (Copyright (c) 2001, 2002 Fabrice Bellard; LGPL-2.1-or-later, see
+// LICENSE-LGPL).
 //! Layer III **stereo processing** — the §2.4.3.4.9 stage that runs after
 //! §2.4.3.4.8 short-block reordering and before alias reduction / the
 //! IMDCT.
@@ -103,7 +110,10 @@ use crate::side_info::{BlockType, GranuleChannel};
 /// for ISO/IEC 13818-3 §2.4.3.2.
 const IS_POS_ILLEGAL: u8 = 7;
 
-/// Number of short-block scalefactor bands per window (`scalefac_s[..12]`).
+/// Number of short-block scalefactor bands per window that carry a
+/// scalefactor (`scalefac_s[..12]`). Band 12, the top of each window, has
+/// none: like FFmpeg's `compute_stereo`, intensity there uses band 11's
+/// position.
 const SHORT_SFB: usize = 12;
 
 /// In a mixed block the short region begins at short scalefactor
@@ -198,16 +208,19 @@ fn process_long(
     let starts = long_band_starts(sample_rate_hz, version);
     let bound_sfb = long_intensity_bound(right, starts);
 
-    for sfb in 0..21 {
+    // Every band up to the top, band 21 included: it has no scalefactor
+    // and takes band 20's intensity position, as in FFmpeg's
+    // compute_stereo ("for last band, use previous scale factor").
+    for sfb in 0..starts.len() {
         let lo = starts[sfb];
-        let hi = starts[sfb + 1];
+        let hi = long_band_end(starts, sfb);
         if sfb < bound_sfb {
             if ms {
                 apply_ms_range(left, right, lo, hi);
             }
             // else: below-bound band passes through (already L/R).
         } else {
-            let is_pos = right_sf.long[sfb];
+            let is_pos = right_sf.long[sfb.min(20)];
             apply_intensity_band(
                 left,
                 right,
@@ -220,6 +233,18 @@ fn process_long(
             );
         }
     }
+}
+
+/// The end (exclusive) of long band `sfb`: band 21 runs to the top line.
+fn long_band_end(starts: &[usize; 22], sfb: usize) -> usize {
+    starts.get(sfb + 1).copied().unwrap_or(NUM_LINES)
+}
+
+/// Start and width, within one window, of short band `sfb`: band 12 runs
+/// to the top of the window.
+fn short_band(starts: &[usize; 13], sfb: usize) -> (usize, usize) {
+    let end = starts.get(sfb + 1).copied().unwrap_or(NUM_LINES / 3);
+    (starts[sfb], end - starts[sfb])
 }
 
 /// Short-block intensity / MS processing. The intensity bound is computed
@@ -242,21 +267,38 @@ fn process_short(
 ) {
     let short_starts = short_band_starts(sample_rate_hz, version);
     let first_short_sfb = if right_gc.mixed_block_flag {
+        MIXED_FIRST_SHORT_SFB
+    } else {
+        0
+    };
+    // Per-window intensity bound: for each window, the band after the
+    // highest short band (band 12 included) holding a non-zero
+    // right-channel line.
+    let bound =
+        [0, 1, 2].map(|win| short_intensity_bound(right, short_starts, win, first_short_sfb));
+
+    if right_gc.mixed_block_flag {
         // The long-coded region — the lines below the mixed coding
         // split `3 · short_starts[3]` (36 at every ISO table, 72 at
         // the MPEG-2.5 8 kHz tables; see
         // `requantize::mixed_long_lines`) — is processed with the
-        // long band layout (it is below the intensity bound for any
-        // real stream, but MS still applies if enabled). Walking the
-        // long bands **up to the split** (rather than a fixed count)
-        // matters twice: the LSF tables put only 6 long bands below
-        // 36 (a fixed 8-band walk would re-process lines 36..54 that
-        // the short walk below also covers, with untransmitted
-        // scalefactor slots doubling as bogus is_pos), and the 8 kHz
-        // tables put the split at 72 (6 bands of width 12).
+        // long band layout. Walking the long bands **up to the split**
+        // (rather than a fixed count) matters twice: the LSF tables put
+        // only 6 long bands below 36 (a fixed 8-band walk would
+        // re-process lines 36..54 that the short walk below also covers,
+        // with untransmitted scalefactor slots doubling as bogus is_pos),
+        // and the 8 kHz tables put the split at 72 (6 bands of width 12).
+        // As FFmpeg's compute_stereo does, these bands are intensity-coded
+        // only when the right channel is zero in every short window
+        // (`non_zero_found`); otherwise they are all below the bound.
+        let short_nonzero = bound.iter().any(|&b| b > first_short_sfb);
         let long_starts = long_band_starts(sample_rate_hz, version);
         let split = 3 * short_starts[MIXED_FIRST_SHORT_SFB];
-        let bound_sfb = long_intensity_bound_range(right, long_starts, 0, split);
+        let bound_sfb = if short_nonzero {
+            usize::MAX
+        } else {
+            long_intensity_bound_range(right, long_starts, 0, split)
+        };
         let mut sfb = 0usize;
         while sfb + 1 < long_starts.len() && long_starts[sfb] < split {
             let lo = long_starts[sfb];
@@ -280,22 +322,10 @@ fn process_short(
             }
             sfb += 1;
         }
-        MIXED_FIRST_SHORT_SFB
-    } else {
-        0
-    };
+    }
 
-    // Per-window intensity bound: for each window, find the highest short
-    // band that holds a non-zero right-channel line.
-    let bound = [
-        short_intensity_bound(right, short_starts, 0, first_short_sfb),
-        short_intensity_bound(right, short_starts, 1, first_short_sfb),
-        short_intensity_bound(right, short_starts, 2, first_short_sfb),
-    ];
-
-    for sfb in first_short_sfb..SHORT_SFB {
-        let s = short_starts[sfb];
-        let w = short_starts[sfb + 1] - short_starts[sfb];
+    for sfb in first_short_sfb..=SHORT_SFB {
+        let (s, w) = short_band(short_starts, sfb);
         let base = 3 * s;
         for (win, &bound_sfb) in bound.iter().enumerate() {
             if sfb < bound_sfb {
@@ -311,7 +341,7 @@ fn process_short(
                     }
                 }
             } else {
-                let is_pos = right_sf.short[sfb][win];
+                let is_pos = right_sf.short[sfb.min(SHORT_SFB - 1)][win];
                 let (kl, kr, intensity_ok) =
                     intensity_factors(is_pos, right_sf.intensity_scale, version);
                 for k in 0..w {
@@ -338,8 +368,8 @@ fn process_short(
 
 /// The first intensity-coded long scalefactor band: one past the band
 /// holding the last non-zero right-channel line over the whole spectrum
-/// (§2.4.3.4.9.1). Returns `21` when the right channel is non-zero up to
-/// the top band (no intensity region).
+/// (§2.4.3.4.9.1). Returns `22` when the right channel is non-zero in the
+/// top band (no intensity region).
 fn long_intensity_bound(right: &[f32; NUM_LINES], starts: &[usize; 22]) -> usize {
     long_intensity_bound_range(right, starts, 0, NUM_LINES)
 }
@@ -363,12 +393,9 @@ fn long_intensity_bound_range(
         Some(line) => {
             // Band holding `line`, plus one (that band is the last
             // non-intensity band).
-            for sfb in 0..21 {
-                if line < starts[sfb + 1] {
-                    return sfb + 1;
-                }
-            }
-            21
+            (0..starts.len())
+                .find(|&sfb| line < long_band_end(starts, sfb))
+                .map_or(starts.len(), |sfb| sfb + 1)
         }
     }
 }
@@ -384,9 +411,8 @@ fn short_intensity_bound(
     first_sfb: usize,
 ) -> usize {
     let mut last_sfb: Option<usize> = None;
-    for sfb in first_sfb..SHORT_SFB {
-        let s = starts[sfb];
-        let w = starts[sfb + 1] - starts[sfb];
+    for sfb in first_sfb..=SHORT_SFB {
+        let (s, w) = short_band(starts, sfb);
         let base = 3 * s;
         for k in 0..w {
             let i = base + 3 * k + window;

@@ -114,8 +114,10 @@ fn decode_via_trait(packets: &[Packet], sample_rate: u32, channels: u16) -> Vec<
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
                     for plane in &a.data {
-                        for chunk in plane.chunks_exact(2) {
-                            out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                        for chunk in plane.chunks_exact(4) {
+                            out.push(oxideav_mp3::synth::pcm_f32_to_i16(f32::from_le_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                            ])));
                         }
                     }
                 }

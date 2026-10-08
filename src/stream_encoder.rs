@@ -4176,6 +4176,19 @@ impl Mp3Encoder {
                                 }
                             }
                         }
+                        // Band 12, the top of each window, has no
+                        // scalefactor: a decoder (FFmpeg's compute_stereo)
+                        // codes it with band 11's position, and its
+                        // right-channel lines count toward each window's
+                        // bound. Couple it too, so the right channel's zero
+                        // part reaches the top of every window and the
+                        // bound lands at `short_start`.
+                        if short_start < 12 {
+                            for i in 3 * short_starts[12]..NUM_LINES {
+                                left[i] += right[i];
+                                right[i] = 0.0;
+                            }
+                        }
                         continue;
                     }
                     let is_pos_bands = &mut is_pos_per_gr[gr];
@@ -4222,7 +4235,9 @@ impl Mp3Encoder {
                     // so there is no position to transmit — couple the
                     // magnitude into the left channel anyway so the
                     // right channel's zero-part reaches the Nyquist
-                    // rate (§2.4.3.4.9.1); the lines decode left-only.
+                    // rate (§2.4.3.4.9.1); a decoder (FFmpeg's
+                    // compute_stereo) codes these lines with band 20's
+                    // position.
                     //
                     // Skip the top region when the adaptive chooser
                     // coupled nothing (`eff_start == 21`): zeroing only

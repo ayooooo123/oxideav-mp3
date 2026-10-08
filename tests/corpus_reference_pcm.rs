@@ -118,9 +118,9 @@ fn production_decode(path: &std::path::Path, channels: u16, sample_rate: u32) ->
                         "decoder plane count != channel count"
                     );
                     for (ch, plane) in a.data.iter().enumerate() {
-                        for chunk in plane.chunks_exact(2) {
-                            let v = i16::from_le_bytes([chunk[0], chunk[1]]);
-                            out[ch].push(f32::from(v) / 32768.0);
+                        for chunk in plane.chunks_exact(4) {
+                            out[ch]
+                                .push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                         }
                     }
                 }

@@ -204,11 +204,15 @@ fn trait_decode_lsf_stereo(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
                         2 * (a.samples as usize),
                         "plane bytes = 2 × sample count (S16 LE)"
                     );
-                    for chunk in a.data[0].chunks_exact(2) {
-                        out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    for chunk in a.data[0].chunks_exact(4) {
+                        out_l.push(oxideav_mp3::synth::pcm_f32_to_i16(f32::from_le_bytes([
+                            chunk[0], chunk[1], chunk[2], chunk[3],
+                        ])));
                     }
-                    for chunk in a.data[1].chunks_exact(2) {
-                        out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    for chunk in a.data[1].chunks_exact(4) {
+                        out_r.push(oxideav_mp3::synth::pcm_f32_to_i16(f32::from_le_bytes([
+                            chunk[0], chunk[1], chunk[2], chunk[3],
+                        ])));
                     }
                 }
                 Ok(other) => panic!("non-audio frame: {other:?}"),
@@ -221,11 +225,15 @@ fn trait_decode_lsf_stereo(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                for chunk in a.data[0].chunks_exact(2) {
-                    out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                for chunk in a.data[0].chunks_exact(4) {
+                    out_l.push(oxideav_mp3::synth::pcm_f32_to_i16(f32::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ])));
                 }
-                for chunk in a.data[1].chunks_exact(2) {
-                    out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                for chunk in a.data[1].chunks_exact(4) {
+                    out_r.push(oxideav_mp3::synth::pcm_f32_to_i16(f32::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ])));
                 }
             }
             Ok(other) => panic!("non-audio frame on flush: {other:?}"),
@@ -352,21 +360,29 @@ fn registry_built_decoder_handles_lsf_stereo_packets() {
         while let Ok(Frame::Audio(a)) = dec.receive_frame() {
             assert_eq!(a.data.len(), 2);
             assert_eq!(a.samples as usize, PCM_PER_GRANULE);
-            for chunk in a.data[0].chunks_exact(2) {
-                out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+            for chunk in a.data[0].chunks_exact(4) {
+                out_l.push(oxideav_mp3::synth::pcm_f32_to_i16(f32::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3],
+                ])));
             }
-            for chunk in a.data[1].chunks_exact(2) {
-                out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+            for chunk in a.data[1].chunks_exact(4) {
+                out_r.push(oxideav_mp3::synth::pcm_f32_to_i16(f32::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3],
+                ])));
             }
         }
     }
     dec.flush().expect("flush");
     while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-        for chunk in a.data[0].chunks_exact(2) {
-            out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+        for chunk in a.data[0].chunks_exact(4) {
+            out_l.push(oxideav_mp3::synth::pcm_f32_to_i16(f32::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3],
+            ])));
         }
-        for chunk in a.data[1].chunks_exact(2) {
-            out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+        for chunk in a.data[1].chunks_exact(4) {
+            out_r.push(oxideav_mp3::synth::pcm_f32_to_i16(f32::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3],
+            ])));
         }
     }
     assert_eq!(out_l, l_direct);

@@ -143,8 +143,10 @@ fn crc_enabled_stream_decodes_via_existing_decoder() {
                     // but for true silence input the energy is bounded
                     // tight). Confirm finite values and a low cap.
                     for plane in &a.data {
-                        for chunk in plane.chunks_exact(2) {
-                            let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        for chunk in plane.chunks_exact(4) {
+                            let s = oxideav_mp3::synth::pcm_f32_to_i16(f32::from_le_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                            ]));
                             assert!(
                                 s.unsigned_abs() < 8000,
                                 "recovered silence sample magnitude too large: {s}"

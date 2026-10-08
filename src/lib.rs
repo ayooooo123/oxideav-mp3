@@ -384,8 +384,13 @@
 //!
 //! The upstream code is MIT. The gapless metadata (`demuxer::gapless`,
 //! `demuxer::smpb`) is ported from FFmpeg and is LGPL-2.1-or-later (see
-//! `LICENSE-LGPL` and each file's notice); the crate as a whole is
-//! `MIT AND LGPL-2.1-or-later`.
+//! `LICENSE-LGPL` and each file's notice). So are the decoder parts that
+//! follow FFmpeg 2da55bf's `libavcodec/mpegaudiodec_template.c` (each
+//! marked in its file's header): the planar float output and the cut and
+//! reservoir-gap frames (`codec_decoder`, `decode_frame` and
+//! `mp_decode_layer3`), the reservoir assembly and scalefactors over a gap
+//! (`scalefactors`), and the intensity-stereo band rules (`stereo`,
+//! `compute_stereo`). The crate as a whole is `MIT AND LGPL-2.1-or-later`.
 //!
 //! [`Encoder`]: oxideav_core::Encoder
 //!
