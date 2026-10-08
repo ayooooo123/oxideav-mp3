@@ -705,12 +705,33 @@ impl Mp3Demuxer {
             first_frame_offset
         };
 
-        // 7. Build the StreamInfo from the first frame. The codec
-        //    parameters carry the same MP3 WAVEFORMATEX tag muxers
-        //    consume to round-trip into AVI/WAV containers.
-        let sample_rate = first_header.sample_rate_hz;
-        let samples_per_frame = first_header.samples_per_frame();
-        let bitrate_kbps = first_header.bitrate_kbps;
+        // 6b. FFmpeg's start search (mp3_read_header): audio starts at
+        //     the first frame whose successor agrees with it under
+        //     MP3_MASK; the frames before it are junk to FFmpeg (a
+        //     first frame in another channel mode, say). The stream's
+        //     parameters come from the frame audio starts at. FFmpeg
+        //     cannot open free-format streams at all; they keep their
+        //     first frame.
+        let (first_audio_frame_offset, start_header) = if free_format_base_len.is_none() {
+            let start = consecutive_start(&mut input, first_audio_frame_offset, total_len)?;
+            let mut start_hdr = [0u8; 4];
+            input.seek(SeekFrom::Start(start))?;
+            let header = if start == first_frame_offset || read_up_to(input.as_mut(), &mut start_hdr)? < 4 {
+                first_header
+            } else {
+                parse_header(&start_hdr).unwrap_or(first_header)
+            };
+            (start, header)
+        } else {
+            (first_audio_frame_offset, first_header)
+        };
+
+        // 7. Build the StreamInfo from the frame audio starts at. The
+        //    codec parameters carry the same MP3 WAVEFORMATEX tag
+        //    muxers consume to round-trip into AVI/WAV containers.
+        let sample_rate = start_header.sample_rate_hz;
+        let samples_per_frame = start_header.samples_per_frame();
+        let bitrate_kbps = start_header.bitrate_kbps;
         // Free-format streams have no table bitrate, but a fixed one:
         // the unpadded body carries `samples_per_frame` samples, so
         // the effective constant bitrate is
@@ -759,10 +780,10 @@ impl Mp3Demuxer {
             (_, dur) => dur,
         });
 
-        let layer = first_header.layer;
+        let layer = start_header.layer;
         let mut params = CodecParameters::audio(CodecId::new(codec_id_for(layer)));
         params.sample_rate = Some(sample_rate);
-        params.channels = Some(channels as u16);
+        params.channels = Some(start_header.channel_count() as u16);
         params.bit_rate = bitrate_bps.map(|b| b as u64);
         params.tag = Some(CodecTag::wave_format(if layer == Layer::LayerIII { WAVE_FORMAT_MP3 } else { WAVE_FORMAT_MPEG }));
 
@@ -920,6 +941,39 @@ fn locate_first_frame(
     Err(Error::invalid(
         "no MPEG audio frame sync within the scan window after ID3v2",
     ))
+}
+
+/// `MP3_MASK` (FFmpeg's libavcodec/mpegaudiodecheader.h): the header bits
+/// the frames of one stream share: sync, version, layer, sample rate,
+/// channel mode, copyright, original and emphasis.
+const MP3_MASK: u32 = 0xFFFE_0CCF;
+
+/// FFmpeg 2da55bf's start search (mp3_read_header): the first offset from
+/// `off`, within 64 KiB, holding a table-bitrate frame whose next frame's
+/// header agrees with its own under [`MP3_MASK`]. What lies before it is
+/// junk to FFmpeg. Without such a pair FFmpeg starts at `off` after
+/// 64 KiB, and refuses the file when its end comes first; this demuxer
+/// starts at `off` in both cases.
+fn consecutive_start(input: &mut Box<dyn ReadSeek>, off: u64, total_len: u64) -> Result<u64> {
+    const WINDOW: usize = 64 * 1024;
+    // A frame is at most 2881 bytes (MPEG-2.5 Layer II at 160 kbit/s).
+    let want = total_len.saturating_sub(off).min((WINDOW + 4096) as u64) as usize;
+    let mut buf = vec![0u8; want];
+    input.seek(SeekFrom::Start(off))?;
+    let n = read_up_to(input.as_mut(), &mut buf)?;
+    buf.truncate(n);
+    let check = |at: usize| -> Option<(u32, usize)> {
+        let b = buf.get(at..at.checked_add(4)?)?;
+        let len = parse_header(b).ok()?.frame_len()?;
+        Some((u32::from_be_bytes([b[0], b[1], b[2], b[3]]), len))
+    };
+    for i in 0..WINDOW.min(buf.len().saturating_sub(3)) {
+        let Some((first, len)) = check(i) else { continue };
+        if check(i + len).is_some_and(|(next, _)| first & MP3_MASK == next & MP3_MASK) {
+            return Ok(off + i as u64);
+        }
+    }
+    Ok(off)
 }
 
 /// Measure the constant **unpadded** body length of a free-format
