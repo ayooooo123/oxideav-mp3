@@ -1091,10 +1091,6 @@ impl Demuxer for Mp3Demuxer {
                     continue;
                 }
             };
-            if self.cursor + len as u64 > self.audio_end_offset {
-                self.finished = true;
-                return Err(Error::Eof);
-            }
             // Refuse to emit a packet whose header looks valid in
             // isolation but doesn't agree with the stream
             // parameters we settled on at open-time. Mid-stream
@@ -1103,14 +1099,16 @@ impl Demuxer for Mp3Demuxer {
                 self.cursor += 1;
                 continue;
             }
-            // Read the rest of the frame.
+            // Read the rest of the frame. A frame the end of the audio
+            // cuts short is still a packet, its bytes up to that end:
+            // FFmpeg's MPEG audio parser hands them on when the input
+            // ends, and its decoders decode the frame over zeros.
+            let len = (len as u64).min(self.audio_end_offset - self.cursor) as usize;
             let mut data = vec![0u8; len];
             data[..4].copy_from_slice(&hdr);
             let read = read_up_to(self.input.as_mut(), &mut data[4..])?;
-            if read + 4 < len {
-                self.finished = true;
-                return Err(Error::Eof);
-            }
+            data.truncate(read + 4);
+            let len = data.len();
             let pts = self.next_pts;
             self.next_pts = self.next_pts.saturating_add(self.samples_per_frame as i64);
             self.cursor += len as u64;
